@@ -1,6 +1,7 @@
 name: ci
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -14,4 +15,4 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: ores-chat-test/.github@617cd06b843d0f926ac2034fb8aec7eae32f9450
+      - uses: ores-chat-test/.github@45aac3517015fdfe2eee74ac53a6ae7fc397cf04
