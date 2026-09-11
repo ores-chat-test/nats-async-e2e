@@ -1,0 +1,242 @@
+name: Async-context message and NATS boundaries
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/async-context-message-boundaries.yml'
+      - 'async_context/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/async-context-message-boundaries.yml'
+      - 'async_context/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: async-context-message-boundaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: ores-otel/ores.otel.log
+  SOURCE_REF: hardening/async-context-fiber-snapshots-20260911
+
+jobs:
+  provenance:
+    name: Resolve one immutable source candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: harness
+          persist-credentials: false
+      - id: resolve
+        name: Resolve the candidate branch once
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha=$(git ls-remote "https://github.com/${SOURCE_REPOSITORY}.git" "refs/heads/${SOURCE_REF}" | awk 'NR == 1 {print $1}')
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'candidate did not resolve to one full SHA' >&2; exit 1; }
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ steps.resolve.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Verify exact identity, ancestry, and manifest coverage
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = '${{ steps.resolve.outputs.source_sha }}'
+          test -z "$(git -C source status --porcelain)"
+          git -C source merge-base --is-ancestor 0109ec4972864d666174f759d87239c8385ba496 HEAD
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          lock = json.loads(Path('harness/async_context/source-under-test.json').read_text())
+          assert lock['repository'] == 'ores-otel/ores.otel.log'
+          assert lock['baseline_sha'] == '0109ec4972864d666174f759d87239c8385ba496'
+          assert lock['message_count'] >= 1024
+          assert lock['worker_count'] >= 8
+          assert set(lock['required_runtimes']) == {'node', 'bun', 'deno', 'go', 'erlang', 'elixir'}
+          PY
+
+  node-pool:
+    name: Node handler-pool and worker-thread carrier boundary
+    needs: provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22.20.0'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - working-directory: source
+        run: |
+          npm ci
+          npm run build
+      - name: Run 1,024-message pooled-handler canary
+        env:
+          SOURCE_ROOT: ${{ github.workspace }}/source
+        run: node harness/async_context/message_pool_canary.mjs
+
+  real-nats:
+    name: Real NATS carrier, corruption, and subscriber-reuse boundary
+    needs: provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      nats:
+        image: nats:2.10.22-alpine
+        ports:
+          - 4222:4222
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22.20.0'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - working-directory: source
+        run: |
+          npm ci
+          npm run build
+      - name: Install the bounded NATS client without lifecycle scripts
+        working-directory: harness
+        run: |
+          npm init -y >/dev/null
+          npm install --no-save --ignore-scripts nats@2.29.1
+      - name: Run 512 real NATS deliveries with explicit context carriers
+        env:
+          SOURCE_ROOT: ${{ github.workspace }}/source
+          NATS_URL: nats://127.0.0.1:4222
+        run: node harness/async_context/real_nats_canary.mjs
+
+  javascript-runtime:
+    name: ${{ matrix.runtime }} AsyncLocalStorage conformance
+    needs: provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [bun, deno]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22.20.0'
+          cache: npm
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.2.22'
+      - if: matrix.runtime == 'deno'
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 'v2.5.1'
+      - run: |
+          npm ci
+          npm run build
+      - if: matrix.runtime == 'bun'
+        run: bun run tests/conformance/run-node.mjs
+      - if: matrix.runtime == 'deno'
+        run: deno run --allow-read --allow-env --allow-net --allow-hrtime tests/conformance/run-node.mjs
+
+  go:
+    name: Go pooled-goroutine explicit context under race detector
+    needs: provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.24.7'
+          cache: false
+      - working-directory: sdk/go
+        run: go test -race -count=3 ./...
+
+  beam:
+    name: ${{ matrix.language }} explicit process-message context
+    needs: provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [erlang, elixir]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          otp-version: '28'
+          elixir-version: '1.19.0'
+      - name: Run process-local scope and explicit child-process handoff tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ matrix.language }}' in
+            erlang) (cd sdk/erlang && bash test.sh) ;;
+            elixir) (cd sdk/elixir && bash test.sh) ;;
+            *) exit 64 ;;
+          esac
+
+  result:
+    name: Require all message-boundary certificates
+    if: always()
+    needs: [provenance, node-pool, real-nats, javascript-runtime, go, beam]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject skipped, cancelled, or failed evidence
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          invalid = {name: value['result'] for name, value in results.items() if value['result'] != 'success'}
+          if invalid:
+              raise SystemExit(f'message-boundary certificate incomplete: {invalid}')
+          print('message carrier, pooled-handler, NATS, worker-thread, Go, and BEAM certificate complete')
+          PY
