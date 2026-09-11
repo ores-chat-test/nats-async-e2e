@@ -1,0 +1,10 @@
+{
+  "schema": "ores-chat-test/async-context-message-boundary/v1",
+  "repository": "ores-otel/ores.otel.log",
+  "ref": "hardening/async-context-fiber-snapshots-20260911",
+  "baseline_sha": "0109ec4972864d666174f759d87239c8385ba496",
+  "purpose": "Adversarial message-consumer reuse, explicit carrier installation, failure cleanup, and cross-tenant non-leakage",
+  "message_count": 1024,
+  "worker_count": 8,
+  "required_runtimes": ["node", "bun", "deno", "go", "erlang", "elixir"]
+}
